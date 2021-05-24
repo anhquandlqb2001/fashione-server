@@ -1,0 +1,14 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.17.1",
+    "firebase-admin": "^9.8.0"
+  },
+  "scripts": {
+    "dev": "nodemon dist/index.js",
+    "watch": "tsc -w"
+  }
+}
