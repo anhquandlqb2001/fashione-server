@@ -17,7 +17,7 @@ const index = client.initIndex('dev_products');
 
 admin.initializeApp({
 	credential: admin.credential.cert(
-		"./fashione-2db2b-firebase-adminsdk-lfujc-b34de39ef8.json"
+		"./fashione-4356d-personal.json"
 	),
 });
 
@@ -384,6 +384,11 @@ db.collection("order_item_statuses").onSnapshot(
 			.forEach(async (doc) => {
 				try {
 					const data = doc.doc.data();
+					
+					if (data.status != EOrderItemStatus[EOrderItemStatus.COMPLETE]) {
+						return
+					}
+					
 					const userId = data.user_id;
 					const response = await db
 						.collection("device_tokens")
