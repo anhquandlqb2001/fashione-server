@@ -1,6 +1,6 @@
 import express, { Request, Response } from "express";
 import admin, { firestore } from "firebase-admin";
-import { DeviceToken, NotificationType } from "./types/notification.type";
+import { DeviceToken, ENotificationType, Notification, NotificationExtend, NotificationOrderStatus, NotificationType } from "./types/notification.type";
 import {
 	OrderItemStatusFirebaseResponse,
 	OrderItemStatusRequest,
@@ -8,6 +8,12 @@ import {
 	EOrderItemStatus,
 } from "./types/order.type";
 import { Review, ReviewRating, ReviewResponse } from "./types/review.type";
+import cors from 'cors'
+import { ResponseBody } from "product.type";
+import algoliasearch from 'algoliasearch';
+
+const client = algoliasearch('3NVM49I7G2', 'd6588fc89921f8e880e645635f82ba32');
+const index = client.initIndex('dev_products');
 
 admin.initializeApp({
 	credential: admin.credential.cert(
@@ -16,6 +22,10 @@ admin.initializeApp({
 });
 
 const app = express();
+
+app.use(cors({
+	origin: "*"
+}))
 
 app.use(express.json());
 
@@ -29,7 +39,6 @@ app.get("/reviews", async (req, res) => {
 		const productId = req.query.product_id;
 		const lastVisibleId = req.query.last_visible_id;
 
-
 		if (!lastVisibleId) {
 			const reviewsResponse = await db
 				.collection("reviews")
@@ -37,9 +46,6 @@ app.get("/reviews", async (req, res) => {
 				.orderBy("created_at", "desc")
 				.limit(PER_PAGE + 1)
 				.get();
-
-			console.log(reviewsResponse.docs.map(it => it.data()));
-
 
 			if (reviewsResponse.empty) {
 				// if reviews is empty then return
@@ -49,8 +55,6 @@ app.get("/reviews", async (req, res) => {
 				reviewsResponse.docs
 			) as Review[];
 			const response = await reviewResponseFactory(reviews);
-			console.log(response);
-
 			return res.json({
 				data: response,
 				last_visible_id: getLastVisibleDocumentId(reviews),
@@ -88,7 +92,6 @@ app.get("/order/status", async (req, res) => {
 		const decodedIdToken = await auth.verifyIdToken(idToken);
 
 		const orderStatusResponse = await db.collection("order_statuses").where("user_id", "==", decodedIdToken.uid).get()
-		console.log(orderStatusResponse.docs.map(it => it.id));
 
 		const snapshot = await db
 			.collection("order_item_statuses")
@@ -96,13 +99,9 @@ app.get("/order/status", async (req, res) => {
 			.select(firestore.FieldPath.documentId(), "status")
 			.get();
 
-
-
 		const readAbleData = getFirestoreObjectWithId(
 			snapshot.docs
 		) as OrderItemStatusFirebaseResponse[];
-
-
 
 		const orderItemStatuses = enumKeys(EOrderItemStatus).map(status => {
 			const orderStatus = readAbleData.filter(it => it.status == status)
@@ -111,22 +110,7 @@ app.get("/order/status", async (req, res) => {
 				quantity: orderStatus.length
 			} as OrderItemStatusRequest
 		})
-
 		return res.json(orderItemStatuses)
-		// const dataPromises = readAbleData.map(async (item) => {
-		// 	const snapshot = await db
-		// 		.collection("order_items")
-		// 		.where("order_id", "==", item.id)
-		// 		.select()
-		// 		.get();
-		// 	return {
-		// 		status: item.status,
-		// 		quantity: snapshot.size,
-		// 	} as DeliveryStatus;
-		// });
-
-		// const data = await Promise.all(dataPromises);
-		// return res.json(deliveryStatusResponseFactory(data));
 	} catch (error) {
 		console.log(error);
 		res.json(error);
@@ -191,8 +175,7 @@ app.post("/notification/token", async (req, res) => {
 
 app.get("/notification/overview", async (req: Request, res: Response) => {
 	try {
-		const token = req.query.token as string;
-		const decodedIdToken = await auth.verifyIdToken(token);
+		const uid = req.query.uid as string;
 
 		const notificationTypeResponse = await db
 			.collection("notification_types")
@@ -205,7 +188,8 @@ app.get("/notification/overview", async (req: Request, res: Response) => {
 			async (notificationType) => {
 				const notificationResponse = await db
 					.collection("notifications")
-					.where("recipient_id", "==", decodedIdToken.uid)
+					.where("recipient_id", "==", uid)
+					.where("type_id", "==", notificationType.id)
 					.select()
 					.get();
 				return {
@@ -290,38 +274,106 @@ app.post("/order", async (req, res) => {
 	}
 });
 
-function enumKeys<O extends object, K extends keyof O = keyof O>(obj: O): K[] {
-	return Object.keys(obj).filter(k => Number.isNaN(+k)) as K[];
-}
-
-const updateOrCreate = async (
-	deviceTokenFirestore: firestore.QuerySnapshot<firestore.DocumentData>,
-	deviceTokenFirestoreWithId: { id: string },
-	deviceToken: DeviceToken
-) => {
+app.post("/notification/:type/:user_id", async (req, res) => {
 	try {
-		if (deviceTokenFirestore.empty) {
-			await db
-				.collection("device_tokens")
-				.add({ user_id: deviceToken.userId, token: deviceToken.token });
+		const userId = req.params.user_id
+		const payload = req.body.payload as admin.messaging.MessagingPayload
+		const type = req.params.type
 
-			return true;
-		}
 
-		await db
-			.collection("device.tokens")
-			.doc(deviceTokenFirestoreWithId.id)
-			.update({ user_id: deviceToken.userId, token: deviceToken.token });
-		return true;
+		const deviceTokenResponse = await db.collection("device_tokens").where("user_id", "==", userId).get()
+		const deviceTokens = deviceTokenResponse.docs.map(it => it.data().token)
+		console.log(deviceTokens);
+
+		const typeResponse = await db.collection("notification_types").where("name", "==", type.toUpperCase()).get()
+		const notificationId = typeResponse.docs[0].id
+
+		const notificationPromises = deviceTokens.map(async token => {
+			const notification: NotificationExtend = {
+				created_at: firestore.FieldValue.serverTimestamp(),
+				deleted: false,
+				read: false,
+				device_id: token,
+				recipient_id: userId,
+				type_id: notificationId,
+				data: {
+					payload: payload
+				}
+			}
+
+			return await db.collection("notifications").add(notification)
+		})
+		await Promise.all(notificationPromises)
+		res.json(true)
 	} catch (error) {
-		return false;
+		console.log(error);
+		res.json(false)
 	}
-};
+})
+
+app.post("/live", async (req, res) => {
+	try {
+		const video = req.body.video
+		const ref = await db.collection("live_videos").add(video)
+		console.log(ref.id);
+
+		return res.json(ref.id)
+	} catch (error) {
+		console.log(error);
+	}
+})
+
+app.delete("/live", async (req, res) => {
+	try {
+		const id = req.query.id
+		await db.collection("live_videos").doc(id as string).delete()
+	} catch (error) {
+
+	}
+})
+
+app.post("/product", async (req, res) => {
+	try {
+		const product = req.body as ResponseBody
+
+		// Add product
+		const productRef = await db.collection("products").add(product.product)
+		// Add product detail
+		await db.collection("product_detail").add({
+			...product.detail,
+			product_id: productRef.id
+		})
+
+		// Add product variants, options, image
+		const productVariantBatch = db.batch()
+		const productVariantOptionBatch = db.batch()
+		const productImageBatch = db.batch()
+		product.variants.forEach(variant => {
+			const variantRef = db.collection("product_variants").doc()
+			productVariantBatch.set(variantRef, { product_id: productRef.id, name: variant.name })
+			variant.options.forEach(option => {
+				const variantOptionRef = db.collection("product_variant_options").doc()
+				productVariantOptionBatch.set(variantOptionRef, { variant_id: variantRef.id, value: option.value, price: option.price, quantity: option.quantity })
+				option.image_url.forEach(image => {
+					const productImageRef = db.collection("product_images").doc()
+					productImageBatch.set(productImageRef, { product_id: productRef.id, variant_id: variantRef.id, variant_option_id: variantOptionRef.id, url: image })
+				})
+			})
+		})
+		await productVariantBatch.commit()
+		await productVariantOptionBatch.commit()
+		await productImageBatch.commit()
+		return res.json(true)
+	} catch (error) {
+		console.log(error);
+		return res.json(false)
+	}
+})
 
 /**
  * observe -> push notification   
  * */
-const observeOrderItemStatus = db.collection("order_item_statuses").onSnapshot(
+db.collection("order_item_statuses").onSnapshot(
 	(querySnapshot) => {
 		if (querySnapshot.docChanges().length != 1) {
 			return;
@@ -332,63 +384,137 @@ const observeOrderItemStatus = db.collection("order_item_statuses").onSnapshot(
 			.forEach(async (doc) => {
 				try {
 					const data = doc.doc.data();
-					if (data.status != "DELIVERED") {
-						return;
-					}
 					const userId = data.user_id;
 					const response = await db
 						.collection("device_tokens")
 						.where("user_id", "==", userId)
 						.get();
 
+					const deviceToken = response.docs[0].data().token
+
+					// data for save db
+					const notificationTypeResponse = await db.collection("notification_types").where("name", "==", ENotificationType[ENotificationType.ORDER_STATUS]).get()
+					const notificationType = getFirestoreObjectWithId(notificationTypeResponse.docs)[0]
+
+					const orderItemResponse = await db.collection("order_items").doc(doc.doc.data().order_item_id).get()
+					const orderItem = orderItemResponse.data()
+					const productImageResponse = await db.collection("product_images")
+						.where("variant_option_id", "==", orderItem.variant_option_id)
+						.get()
+
+					console.log(productImageResponse);
+
+
+					const notification: NotificationOrderStatus = {
+						deleted: false,
+						read: false,
+						device_id: deviceToken,
+						created_at: firestore.FieldValue.serverTimestamp(),
+						type_id: notificationType.id,
+						data: {
+							product: {
+								order_id: orderItem.order_id,
+								order_item_id: orderItemResponse.id
+							},
+							payload: {}
+						},
+						recipient_id: userId
+					}
+
+					console.log("1");
+
+					// push notification
+					if (data.status != EOrderItemStatus[EOrderItemStatus.DELIVERED]) {
+						const payload: admin.messaging.MessagingPayload = {
+							notification: { title: "Cập nhật trạng thái đơn hàng" }
+						}
+						switch (data.status) {
+							case EOrderItemStatus[EOrderItemStatus.COLLECTING]:
+								payload.notification.body = "Đơn hàng của bạn đang được xuất kho"
+
+								break;
+							case EOrderItemStatus[EOrderItemStatus.DELIVERING]:
+
+								payload.notification.body = "Đơn hàng của bạn đang được vận chuyển"
+
+								break;
+							case EOrderItemStatus[EOrderItemStatus.CONFIRMING]:
+								payload.notification.body = "Đơn hàng đang được xác nhận bởi shop"
+
+								break;
+							default:
+								break;
+						}
+
+						payload.notification.image = productImageResponse.docs[0].data().url
+						const push = await pushNotification(deviceToken, payload)
+						console.log("push", push);
+
+						notification.data.payload = payload // update payload to object
+						await db.collection("notifications").add(notification) // save db
+						return
+					}
+
 					const payload = {
 						notification: {
-							title: "Đơn hàng của bạn đã được giao thành công",
-							body: "",
+							title: "Giao hàng thành công",
+							body: "Kiện hàng của bạn đã được giao thành công đến bạn",
 							image:
-								"https://i.vietgiaitri.com/2019/9/4/la-nguoi-thu-ba-toi-chet-dung-khi-doc-tin-nhan-anh-gui-vo-530a9a.jpg",
+								productImageResponse.docs[0].data().url,
 						},
 					} as admin.messaging.MessagingPayload;
-					const push = await admin
-						.messaging()
-						.sendToDevice(response.docs[0].data().token, payload);
-					console.log(push);
+					console.log(2);
 
+					const push = await pushNotification(deviceToken, payload)
+					console.log(push);
+					console.log(3);
+
+
+					notification.data.payload = payload // update payload to object
+					await db.collection("notifications").add(notification) // save db
+					return
 				} catch (error) {
 					console.log(error);
 				}
 			});
-
-		// ...
 	},
 	(err) => {
 		console.log(`Encountered error: ${err}`);
 	}
 );
 
+db.collection("products").onSnapshot((snapshot) => {
+	if (snapshot.docChanges().length != 1) {
+		return;
+	}
+	snapshot
+		.docChanges()
+		.slice(0, 1)
+		.forEach(async (doc) => {
+			try {
+				const exist = await db.collection("products").doc(doc.doc.id).get()
+				if (!exist.exists) {
+					return
+				}
+				const detailRef = await db.collection("product_detail").where("product_id", "==", exist.id).get()
+
+				const data = doc.doc.data();
+				const prod = { id: doc.doc.id, ...data, description: detailRef.docs[0].data().description }
+				await index.saveObject(prod, { autoGenerateObjectIDIfNotExist: true })
+			} catch (e) {
+				console.log(e);
+			}
+		})
+})
+
 app.listen(3000, () => console.log("connected"));
 
-const deliveryStatusResponseFactory = (data: OrderItemStatusRequest[]) => {
-	const arr = data.map((delivery) => {
-		let sum = data
-			.map((o) => {
-				if (o.status == delivery.status) {
-					return o.quantity;
-				}
-				return 0;
-			})
-			.reduce((a, c) => {
-				return a + c;
-			});
-		return {
-			status: delivery.status,
-			quantity: sum,
-		} as OrderItemStatusRequest;
-	});
-	return arr.filter(
-		(v, i, a) => a.findIndex((t) => t.status === v.status) === i
-	);
-};
+
+const pushNotification = async (token: string, payload: admin.messaging.MessagingPayload) => {
+	return await admin
+		.messaging()
+		.sendToDevice(token, payload);
+}
 
 const getLastVisibleDocumentId = (reviews: Review[]): string | null => {
 	if (reviews.length == PER_PAGE + 1) return reviews[reviews.length - 1].id;
@@ -439,3 +565,31 @@ const reviewResponseFactory = async (reviews: Review[]) => {
 		} as ReviewResponse;
 	});
 };
+
+const updateOrCreate = async (
+	deviceTokenFirestore: firestore.QuerySnapshot<firestore.DocumentData>,
+	deviceTokenFirestoreWithId: { id: string },
+	deviceToken: DeviceToken
+) => {
+	try {
+		if (deviceTokenFirestore.empty) {
+			await db
+				.collection("device_tokens")
+				.add({ user_id: deviceToken.userId, token: deviceToken.token });
+
+			return true;
+		}
+
+		await db
+			.collection("device.tokens")
+			.doc(deviceTokenFirestoreWithId.id)
+			.update({ user_id: deviceToken.userId, token: deviceToken.token });
+		return true;
+	} catch (error) {
+		return false;
+	}
+};
+
+function enumKeys<O extends object, K extends keyof O = keyof O>(obj: O): K[] {
+	return Object.keys(obj).filter(k => Number.isNaN(+k)) as K[];
+}
