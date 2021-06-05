@@ -1,5 +1,6 @@
 import express, { Request, Response } from "express";
 import admin, { firestore } from "firebase-admin";
+import bigquery, { BigQuery } from '@google-cloud/bigquery'
 import { DeviceToken, ENotificationType, Notification, NotificationExtend, NotificationOrderStatus, NotificationType } from "./types/notification.type";
 import {
 	OrderItemStatusFirebaseResponse,
@@ -17,7 +18,7 @@ const index = client.initIndex('dev_products');
 
 admin.initializeApp({
 	credential: admin.credential.cert(
-		"./fashione-4356d-personal.json"
+		"./fashione-4356d-firebase-adminsdk-x05j7-3171fbde15.json"
 	),
 });
 
@@ -31,8 +32,106 @@ app.use(express.json());
 
 const db = admin.firestore();
 const auth = admin.auth();
+const query = new BigQuery({ projectId: "fashione-4356d" });
 
 const PER_PAGE = 9;
+
+
+/**
+ * MOST_VIEW in 30 day
+ * SELECT
+	params.value.string_value AS product_id,
+	COUNT(params.value.string_value) AS count
+FROM
+	`fashione-4356d.analytics_274329586.events_*`,
+	UNNEST(event_params) AS params
+WHERE
+	PARSE_DATE('%Y%m%d',
+		_TABLE_SUFFIX) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+	AND CURRENT_DATE()
+	AND event_name = "select_item"
+	AND params.key = "item_id"
+GROUP BY
+	product_id
+ORDER BY count
+ */
+
+const most_view_query = "SELECT " +
+"params.value.string_value AS product_id, " +
+"COUNT(params.value.string_value) AS count " +
+"FROM " +
+'`fashione-4356d.analytics_274329586.events_*`, ' +
+`UNNEST(event_params) AS params
+WHERE
+PARSE_DATE('%Y%m%d',
+	_TABLE_SUFFIX) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+AND CURRENT_DATE()
+AND event_name = "select_item"
+AND params.key = "item_id"
+GROUP BY product_id
+ORDER BY count DESC
+LIMIT 10`
+
+app.get("/products/most_view", async (req, res) => {
+	try {
+		const simpleQueryRowsResponse = await query.query({ query: most_view_query, useLegacySql: false })
+		return res.json({ids: simpleQueryRowsResponse[0].map(it => it.product_id)})
+	} catch (error) {
+		console.log(error);
+
+	}
+})
+
+app.get("/hot", async (req, res) => {
+	try {
+		const lastVisibleId = req.query.last_visible_id;
+
+		if (!lastVisibleId) {
+			const productResponse = await db
+				.collection("products")
+				.orderBy("created_at", "desc")
+				.limit(PER_PAGE + 1)
+				.get();
+
+
+			if (productResponse.empty) {
+				// if prd is empty then return
+				return res.json({ data: [], last_visible_id: null });
+			}
+			const product = getFirestoreObjectWithId(
+				productResponse.docs
+			)
+
+			return res.json({
+				data: product,
+				last_visible_id: getLastVisibleDocumentId(product),
+			});
+		}
+
+		const docRef = db.collection("products").doc(lastVisibleId as string);
+		const snapshot = await docRef.get();
+		const startAtSnapshot = db
+			.collection("products")
+			.orderBy("created_at", "desc")
+			.startAfter(snapshot);
+
+		const productResponse = await startAtSnapshot.limit(PER_PAGE + 1).get();
+		if (productResponse.empty) {
+			// if prod is empty then return
+			res.json({ data: [], lastVisibleId: null });
+			return;
+		}
+		const products = getFirestoreObjectWithId(productResponse.docs) as Review[];
+		return res.json({
+			data: products,
+			last_visible_id: getLastVisibleDocumentId(products),
+		});
+	} catch (error) {
+		console.log(error);
+
+		res.json(error);
+	}
+})
 
 app.get("/reviews", async (req, res) => {
 	try {
@@ -47,6 +146,7 @@ app.get("/reviews", async (req, res) => {
 				.limit(PER_PAGE + 1)
 				.get();
 
+
 			if (reviewsResponse.empty) {
 				// if reviews is empty then return
 				return res.json({ data: [], last_visible_id: null });
@@ -55,6 +155,7 @@ app.get("/reviews", async (req, res) => {
 				reviewsResponse.docs
 			) as Review[];
 			const response = await reviewResponseFactory(reviews);
+
 			return res.json({
 				data: response,
 				last_visible_id: getLastVisibleDocumentId(reviews),
@@ -82,6 +183,8 @@ app.get("/reviews", async (req, res) => {
 			last_visible_id: getLastVisibleDocumentId(reviews),
 		});
 	} catch (error) {
+		console.log(error);
+
 		res.json(error);
 	}
 });
@@ -113,7 +216,7 @@ app.get("/order/status", async (req, res) => {
 		return res.json(orderItemStatuses)
 	} catch (error) {
 		console.log(error);
-		res.json(error);
+		res.json([]);
 	}
 });
 
@@ -231,6 +334,8 @@ app.post("/order", async (req, res) => {
 		const orderItemStatusBatch = db.batch();
 		const orderStatuseBatch = db.batch()
 		orderItemIds.forEach((id) => {
+			console.log(id);
+			
 			const orderItemStatusRef = db.collection("order_item_statuses").doc();
 			orderItemStatusBatch.set(orderItemStatusRef, {
 				order_id: orderReponse.id,
@@ -274,17 +379,21 @@ app.post("/order", async (req, res) => {
 	}
 });
 
-app.post("/notification/:type/:user_id", async (req, res) => {
+app.post("/notification/:type/", async (req, res) => {
 	try {
-		const userId = req.params.user_id
+		let userId = req.params.user_id as any
 		const payload = req.body.payload as admin.messaging.MessagingPayload
 		const type = req.params.type
 
+		if (!userId) {
+			const users = await admin.auth().listUsers()
+			userId = users.users.map(it => it.uid)
+		} else {
+			userId = [userId]
+		}
 
-		const deviceTokenResponse = await db.collection("device_tokens").where("user_id", "==", userId).get()
-		const deviceTokens = deviceTokenResponse.docs.map(it => it.data().token)
-		console.log(deviceTokens);
-
+		const deviceTokenResponse = await db.collection("device_tokens").where("user_id", "in", userId).get()
+		const deviceTokens = deviceTokenResponse.docs.map(it => it.data())
 		const typeResponse = await db.collection("notification_types").where("name", "==", type.toUpperCase()).get()
 		const notificationId = typeResponse.docs[0].id
 
@@ -293,8 +402,8 @@ app.post("/notification/:type/:user_id", async (req, res) => {
 				created_at: firestore.FieldValue.serverTimestamp(),
 				deleted: false,
 				read: false,
-				device_id: token,
-				recipient_id: userId,
+				device_id: token.token,
+				recipient_id: token.user_id,
 				type_id: notificationId,
 				data: {
 					payload: payload
@@ -337,7 +446,7 @@ app.post("/product", async (req, res) => {
 		const product = req.body as ResponseBody
 
 		// Add product
-		const productRef = await db.collection("products").add(product.product)
+		const productRef = await db.collection("products").add({ ...product.product, created_at: firestore.FieldValue.serverTimestamp() })
 		// Add product detail
 		await db.collection("product_detail").add({
 			...product.detail,
@@ -370,6 +479,17 @@ app.post("/product", async (req, res) => {
 	}
 })
 
+app.post("/message", async (req, res) => {
+	try {
+		const body = req.body
+		await db.collection("messages").add({...body, created_at: firestore.FieldValue.serverTimestamp()})
+		return res.json(true)
+	} catch(e) {
+		console.log(e)
+		return res.json(false)
+	}
+})
+
 /**
  * observe -> push notification   
  * */
@@ -384,11 +504,11 @@ db.collection("order_item_statuses").onSnapshot(
 			.forEach(async (doc) => {
 				try {
 					const data = doc.doc.data();
-					
-					if (data.status != EOrderItemStatus[EOrderItemStatus.COMPLETE]) {
+
+					if (data.status == EOrderItemStatus[EOrderItemStatus.COMPLETE]) {
 						return
 					}
-					
+
 					const userId = data.user_id;
 					const response = await db
 						.collection("device_tokens")
@@ -543,6 +663,7 @@ const reviewResponseFactory = async (reviews: Review[]) => {
 		ratingsResponse.docs
 	) as ReviewRating[];
 	const users = await auth.getUsers(reviews.map((it) => ({ uid: it.user_id })));
+
 	const ordersResponse = await db
 		.collection("order_items")
 		.where(
