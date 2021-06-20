@@ -1,19 +1,18 @@
+import { BigQuery } from '@google-cloud/bigquery';
+import algoliasearch from 'algoliasearch';
+import cors from 'cors';
 import express, { Request, Response } from "express";
 import admin, { firestore } from "firebase-admin";
-import bigquery, { BigQuery } from '@google-cloud/bigquery'
-import { DeviceToken, ENotificationType, Notification, NotificationExtend, NotificationOrderStatus, NotificationType } from "./types/notification.type";
+import { ResponseBody } from "product.type";
+import { DeviceToken, ENotificationType, NotificationExtend, NotificationOrderStatus, NotificationType } from "./types/notification.type";
 import {
-	OrderItemStatusFirebaseResponse,
-	OrderItemStatusRequest,
-	OrderItem,
-	EOrderItemStatus,
+	EOrderItemStatus, OrderItem, OrderItemStatusFirebaseResponse,
+	OrderItemStatusRequest
 } from "./types/order.type";
 import { Review, ReviewRating, ReviewResponse } from "./types/review.type";
-import cors from 'cors'
-import { ResponseBody } from "product.type";
-import algoliasearch from 'algoliasearch';
+import { EnumSaleType, SaleRequestData } from './types/sales.type';
 
-const client = algoliasearch('3NVM49I7G2', 'd6588fc89921f8e880e645635f82ba32');
+const client = algoliasearch(process.env.ALGOLIA_API_ID, process.env.ALGOLIA_API_KEY);
 const index = client.initIndex('dev_products');
 
 admin.initializeApp({
@@ -32,7 +31,7 @@ app.use(express.json());
 
 const db = admin.firestore();
 const auth = admin.auth();
-const query = new BigQuery({ projectId: "fashione-4356d" });
+const query = new BigQuery({ projectId: process.env.GOOGLE_CLOUD_PROJECT });
 
 const PER_PAGE = 9;
 
@@ -57,11 +56,11 @@ ORDER BY count
  */
 
 const most_view_query = "SELECT " +
-"params.value.string_value AS product_id, " +
-"COUNT(params.value.string_value) AS count " +
-"FROM " +
-'`fashione-4356d.analytics_274329586.events_*`, ' +
-`UNNEST(event_params) AS params
+	"params.value.string_value AS product_id, " +
+	"COUNT(params.value.string_value) AS count " +
+	"FROM " +
+	'`fashione-4356d.analytics_274329586.events_*`, ' +
+	`UNNEST(event_params) AS params
 WHERE
 PARSE_DATE('%Y%m%d',
 	_TABLE_SUFFIX) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
@@ -75,7 +74,7 @@ LIMIT 10`
 app.get("/products/most_view", async (req, res) => {
 	try {
 		const simpleQueryRowsResponse = await query.query({ query: most_view_query, useLegacySql: false })
-		return res.json({ids: simpleQueryRowsResponse[0].map(it => it.product_id)})
+		return res.json({ ids: simpleQueryRowsResponse[0].map(it => it.product_id) })
 	} catch (error) {
 		console.log(error);
 
@@ -335,7 +334,7 @@ app.post("/order", async (req, res) => {
 		const orderStatuseBatch = db.batch()
 		orderItemIds.forEach((id) => {
 			console.log(id);
-			
+
 			const orderItemStatusRef = db.collection("order_item_statuses").doc();
 			orderItemStatusBatch.set(orderItemStatusRef, {
 				order_id: orderReponse.id,
@@ -482,13 +481,30 @@ app.post("/product", async (req, res) => {
 app.post("/message", async (req, res) => {
 	try {
 		const body = req.body
-		await db.collection("messages").add({...body, created_at: firestore.FieldValue.serverTimestamp()})
+		await db.collection("messages").add({ ...body, created_at: firestore.FieldValue.serverTimestamp() })
 		return res.json(true)
-	} catch(e) {
+	} catch (e) {
 		console.log(e)
 		return res.json(false)
 	}
 })
+
+
+app.post("/sales", async (req, res) => {
+	try {
+		const { sale } = req.body as SaleRequestData
+
+		const createdAt = firestore.Timestamp.now().toMillis()
+		const expiredAt = createdAt + milliseconds(sale.time)
+
+		await db.collection("sales").add({ ...sale, sale_type: EnumSaleType[sale.sale_type], created_at: firestore.FieldValue.serverTimestamp(), expired_at: firestore.Timestamp.fromMillis(expiredAt) })
+		return res.json(true)
+	} catch (error) {
+		console.log(error);
+	}
+})
+
+const milliseconds = (h: number) => ((h * 60 * 60) * 1000);
 
 /**
  * observe -> push notification   
