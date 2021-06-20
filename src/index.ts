@@ -31,7 +31,7 @@ app.use(express.json());
 
 const db = admin.firestore();
 const auth = admin.auth();
-const query = new BigQuery({ projectId: process.env.GOOGLE_CLOUD_PROJECT });
+const query = new BigQuery({ projectId: "" });
 
 const PER_PAGE = 9;
 
